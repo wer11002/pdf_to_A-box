@@ -45,7 +45,8 @@ def call_llama(prompt: str) -> str:
         "temperature": 0
     }
 
-    response = requests.post(API_URL, headers=headers, json=payload)
+    # Added timeout=60 to prevent the script from freezing!
+    response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
 
@@ -87,7 +88,8 @@ def image_to_markdown(image_bytes: bytes) -> str:
         "temperature": 0
     }
 
-    response = requests.post(API_URL, headers=headers, json=payload)
+    # Added timeout=60 to prevent the script from freezing!
+    response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
     
     if response.status_code == 401:
         error_msg = response.json().get("error", {}).get("message", "Unauthorized")
@@ -103,7 +105,8 @@ def image_to_markdown(image_bytes: bytes) -> str:
     if "choices" not in data or not data["choices"]:
         raise ValueError(f"❌ Unexpected OpenRouter response: {data}")
         
-    return data["choices"][0]["message"]["content"]
-    # Strip any potential markdown code blocks (e.g., ```markdown ... ```)
+    # FIXED: Store it in a variable first, THEN clean it, THEN return it.
+    ai_markdown = data["choices"][0]["message"]["content"]
     ai_markdown = ai_markdown.replace("```markdown", "").replace("```", "").strip()
+    
     return ai_markdown
