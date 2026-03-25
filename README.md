@@ -32,6 +32,13 @@ Batch processor that reconstructs multi-column academic PDFs into clean Markdown
   - [Step-by-Step Execution](#step-by-step-execution)
   - [Verification Steps](#verification-steps)
   - [Cleanup \& Post-Processing](#cleanup--post-processing)
+- [Setup & Execution (Git)](#setup--execution-git)
+  - [System Requirements](#system-requirements)
+  - [Dependency Versions](#dependency-versions)
+  - [Clone and Install](#clone-and-install)
+  - [Run the Pipeline](#run-the-pipeline)
+  - [Troubleshooting Installation \& Runtime](#troubleshooting-installation--runtime)
+- [Project Summary](#project-summary)
 - [Contribution Guidelines](#contribution-guidelines)
 - [License](#license)
 
@@ -216,6 +223,72 @@ print(md)
   - Ensure PDFs are in `./pdfs/` and readable.
   - Check logs for exceptions (network, OCR failures).
 
+## Part 2 – extract_to_json.py Documentation
+
+The second main component [extract_to_json.py](file:///Users/guide/workspace/univercity/year3_sem2/new_end_project/extract_to_json.py#L1-247) converts the Markdown outputs into structured JSON for downstream analytics.
+
+### Role and Features
+
+- Parses ALL Markdown files under `output/`.
+- Pure Python parser scans the entire document for Markdown tables (no LLM influence on numeric data).
+- Calls a strictly confined LLM prompt to extract only two metadata fields: paper title and datasets (ignores models/frameworks).
+- Merges pure-Python parsed experiment metrics with LLM-provided metadata into a final `final_results.json`.
+
+### JSON Extraction Logic
+
+- `extract_tables_with_python(markdown)`:
+  - Iterates through all Markdown tables in the document.
+  - Rejects configuration/hardware tables via heuristic keywords.
+  - Rejects rows that are purely numeric or known library names.
+  - Produces a list of `{ "model": <str>, "results": { <metric>: <float>, ... } }` items.
+- `create_metadata_prompt(body_chunk, paper_id)`:
+  - Constrains the LLM to extract only the official paper title and explicitly named datasets.
+  - Excludes ML model names from datasets by instruction.
+- `clean_json_response(text)`:
+  - Extracts the first valid JSON object from the LLM output defensively.
+- `_build_logical_aliases(raw_names)`:
+  - Deduplicates model names by aliasing variants and acronyms to a canonical form.
+
+### Data Transformation and Output
+
+- For each `paperX.md`:
+  - Pure-Python parsed tables → experiments list.
+  - LLM → `{ "title": "...", "datasets": [...] }` only.
+  - Merge logic removes duplicates and keeps numeric data source-of-truth from Python parsing.
+  - Writes a single `final_results.json` at project root containing all papers:
+
+```json
+[
+  {
+    "paper_id": "paper1",
+    "datasets": ["Official Title", "ImageNet", "KITTI"],
+    "experiments": [
+      { "model": "ModelA", "results": { "Accuracy": 0.91, "F1": 0.88 } },
+      { "model": "ModelB", "results": { "Accuracy": 0.89 } }
+    ]
+  }
+]
+```
+
+### Usage and Examples
+
+Assuming Markdown files exist in `./output/` (produced by the extractor):
+
+```bash
+python3 extract_to_json.py
+```
+
+- The script discovers all `*.md` in `output/`, pauses between files to control API usage, and writes `final_results.json` to the project root.
+
+### Error Handling
+
+- Missing Markdown files:
+  - Prints `❌ No .md files found in output/` and exits gracefully.
+- LLM failures:
+  - If the LLM call fails/times out, the script continues with empty metadata: `{"title": "", "datasets": []}` and still outputs experiments from Python parsing.
+- Path sanitation:
+  - Filters out path-like strings and citations from dataset and model fields.
+
 
 ## Part 2 – Workflow / Flow Documentation
 
@@ -223,7 +296,6 @@ print(md)
 
 1. Discover input PDFs under `pdfs/`.
 2. Start parallel workers (up to 4) to process files concurrently.
-3. For each PDF:
    - Iterate pages; extract clean multi-column text (header/footer suppression).
    - Detect `TABLE X` captions and compute a region-of-interest (ROI) per caption.
    - Attempt table reconstruction in order:
@@ -232,62 +304,56 @@ print(md)
      - pdfplumber fallback for vector-based tables.
    - Validate/align/merge detected tables and append to page.
    - Append a summary block at the end of the document.
+4. Second-stage JSON extraction:
+   - Scan all Markdown outputs in `output/`.
+   - Parse ALL tables via pure Python (no LLM on numeric values).
+   - Ask LLM only for title and datasets metadata.
+   - Merge and write a single consolidated `final_results.json`.
 
 ### Component Interaction
 
 - `PDFProcessor` orchestrates page operations and calls `TableEngine` for reconstruction.
 - `TableEngine` delegates to `OCRTableReconstructor`, `ColumnAligner`, `HeaderReconstructor`, and `StructuralValidator` for robust, clean tables.
 - `llama_client` is called when Vision AI mode is enabled to convert a table image to Markdown.
+- `extract_to_json.py` ingests `./output/*.md`, parses tables, and calls `llama_client.call_llama` for minimal metadata only.
 
 ### ASCII Workflow Diagram
 
 ```
-+-----------------------+
-|  Batch Entrypoint     |
-|  pdf_batch_extractor  |
-+-----------+-----------+
-            |
-            v
-   Discover PDFs in ./pdfs
-            |
-            v
-  +---------+----------+
-  | Parallel Processing |
-  +---------+----------+
-            |
-            v
-     Per-PDF Processing
-            |
-            v
-   +--------+--------+
-   |  Per Page Loop  |
-   +--------+--------+
-            |
-   Clean text (columns)
-            |
-            v
-  Detect "TABLE X" captions
-            |
-            v
-  Compute ROI per caption
-            |
-            v
-  Try Vision AI  -> success? -> append Markdown table
-        |  no
-        v
-       OCR      -> success? -> align/validate -> append
-        |  no
-        v
-    pdfplumber -> success? -> clean/merge -> append
-        |  no
-        v
-     record failure
-            |
-            v
-   Append page separator
-            |
-            v
-   Append summary block
+                ┌───────────────────────────┐
+                │  pdf_batch_extractor_new  │
+                │      (per PDF)            │
+                └─────────────┬─────────────┘
+                              │
+                              v
+                 Clean text + Table ROIs
+                              │
+     ┌───────────────┬────────┴─────────┬───────────────┐
+     │               │                  │               │
+     v               v                  v               v
+ Vision AI      OCR Reconstruction   pdfplumber      Failure note
+  (optional)     (X/Y clustering)     Fallback       (logged only)
+     │               │                  │
+     └─────── Tables (Markdown Grid) ───┘
+                              │
+                              v
+                  Append to Page Output
+                              │
+                              v
+                      ./output/paperX.md
+                              │
+                              v
+                ┌───────────────────────────┐
+                │      extract_to_json      │
+                │  (batch over output/)     │
+                └─────────────┬─────────────┘
+                              │
+       Parse ALL Markdown tables (Pure Python)
+                              │
+         + LLM (Title & Datasets ONLY)
+                              │
+                              v
+                    final_results.json
 ```
 
 ### Timing and Resources
@@ -296,6 +362,7 @@ print(md)
 - Vision AI calls: network-bound, 60s timeout per request; backoff on 429s; immediate failure on 401s.
 - OCR: CPU/memory heavy proportional to ROI size and `OCR_SCALE`.
 - pdfplumber fallback: fast for vector-based tables.
+ - JSON stage: lightweight, dominated by LLM latency for short prompts.
 
 
 ## Part 3 – Usage Order / Sequence
@@ -318,6 +385,11 @@ python3 pdf_batch_extractor_new.py
 ```
 
 3. Monitor console logs for extraction status and errors.
+5. Convert Markdown to consolidated JSON:
+
+```bash
+python3 extract_to_json.py
+```
 4. Review output Markdown files under `./output/`.
 
 ### Verification Steps
@@ -325,13 +397,98 @@ python3 pdf_batch_extractor_new.py
 - Each output file contains:
   - Ordered page text (`## Page N` headers).
   - Appended `=== DETECTED IMAGE-BASED TABLES ===` blocks per page (if any found).
-  - Final `--- PROCESSING SUMMARY ---` showing counts and error totals.
+- `final_results.json` exists and includes entries for all processed `paperX.md` files.
+- Spot-check tables against the original PDFs to validate structure and values.
 - Spot-check tables against the original PDFs to validate structure and values.
 
 ### Cleanup & Post-Processing
 
 - If you created additional temporary assets for debugging, remove them.
 - Optional: maintain an archive of the `output/` directory per run timestamp.
+## Setup & Execution (Git)
+
+### System Requirements
+
+- OS: macOS 12+ (Monterey) or Ubuntu 22.04+ (Jammy) or Windows 10+
+- CPU: Any modern x86_64; OCR performance improves with more cores
+- RAM: 8 GB minimum (16 GB recommended for large PDFs)
+- Storage: 1 GB free (depends on number/size of PDFs)
+- Python: 3.9–3.12 (tested with 3.9)
+- Tesseract OCR: 5.5.2+
+
+### Dependency Versions
+
+The pipeline has been tested with:
+
+- PyMuPDF 1.26.5
+- pdfplumber 0.11.8
+- pytesseract 0.3.13
+- Pillow 11.3.0
+- requests 2.32.5
+- python-dotenv 1.2.1
+- pypdf 6.9.2
+- Tesseract OCR 5.5.2
+
+### Clone and Install
+
+```bash
+git clone <your-repo-url> pdf-extractor
+cd pdf-extractor
+
+# macOS (Tesseract)
+brew install tesseract
+
+# Ubuntu (Tesseract)
+sudo apt update && sudo apt install -y tesseract-ocr
+
+# Python deps
+pip3 install PyMuPDF==1.26.5 pdfplumber==0.11.8 pytesseract==0.3.13 \
+  Pillow==11.3.0 requests==2.32.5 python-dotenv==1.2.1 pypdf==6.9.2
+```
+
+Optional: Vision AI (OpenRouter)
+```bash
+echo 'OPENROUTER_API_KEY=sk-or-xxxxxxxx' > .env
+```
+
+### Run the Pipeline
+
+```bash
+# 1) Generate Markdown from PDFs
+python3 pdf_batch_extractor_new.py
+
+# 2) Convert Markdown tables to JSON
+python3 extract_to_json.py
+```
+
+### Troubleshooting Installation & Runtime
+
+- `ModuleNotFoundError: requests` or other library: run the pip install line above again.
+- `tesseract: command not found`: install Tesseract and confirm with `tesseract --version`.
+- Vision AI `401 Unauthorized`: set a valid `OPENROUTER_API_KEY` in `.env` and restart your shell.
+- `NotOpenSSLWarning`: benign; if requests fail due to SSL on macOS system Python, install Python via `pyenv` or use a virtualenv with OpenSSL.
+- Empty or missing `output/*.md`: ensure PDFs exist in `pdfs/` and are readable; review console logs for page-level errors.
+
+## Project Summary
+
+- [pdf_batch_extractor_new.py](file:///Users/guide/workspace/univercity/year3_sem2/new_end_project/pdf_batch_extractor_new.py#L1-398)
+  - Purpose: Batch process PDFs into Markdown with robust, validated table reconstructions appended per page.
+  - Inputs: PDFs under `./pdfs/`.
+  - Outputs: Markdown files under `./output/` with text and tables.
+  - Key: Multi-pass table extraction (Vision AI → OCR → pdfplumber), caption-based ROI calculation, structural validation.
+
+- [extract_to_json.py](file:///Users/guide/workspace/univercity/year3_sem2/new_end_project/extract_to_json.py#L1-247)
+  - Purpose: Parse all Markdown tables and output a consolidated `final_results.json`.
+  - Inputs: Markdown files under `./output/`.
+  - Outputs: `final_results.json` with experiments per paper plus LLM-provided title/datasets.
+  - Key: Pure-Python parsing for numeric fidelity; LLM is strictly constrained to metadata only.
+
+- [llama_client.py](file:///Users/guide/workspace/univercity/year3_sem2/new_end_project/llama_client.py)
+  - Purpose: Vision AI and text-only client (OpenRouter). Handles retries, backoff, and 401 detection.
+  - Inputs: Image bytes for table screenshots (Vision), prompt strings (text).
+  - Outputs: Markdown table strings or JSON text.
+
+Overall: The extraction system converts complex, multi-column academic PDFs into structured Markdown with accurate tables, then produces a clean, consolidated JSON artifact for analytics while keeping numeric data integrity anchored in deterministic Python parsing.
 
 
 ## Contribution Guidelines
@@ -351,4 +508,3 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
